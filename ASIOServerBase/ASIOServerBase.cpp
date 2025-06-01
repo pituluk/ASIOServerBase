@@ -24,7 +24,7 @@ struct userData {
 };
 bool onConnect(std::shared_ptr<TCPConnection> connection)
 {
-    std::cout << "New connection established. ID" << connection->id << std::endl;
+    std::cout << "New connection established. "<<connection->realIP<< " ID" << connection->id << std::endl;
     connection->userData = userData{};
     auto& udr = std::any_cast<userData&>(connection->userData);
     udr.connectedOn = getTimeSeconds();
@@ -83,17 +83,26 @@ void onData(std::shared_ptr<TCPConnection> connection, const std::vector<std::ui
         buffer.erase(buffer.begin(), buffer.begin() + headerSize + len);
     }
 }
-
+void udpData(UDPServer& server,const asio::ip::udp::endpoint& remote, const std::vector<std::uint8_t>& data)
+{
+    std::string s(data.begin(), data.end());
+    std::cout << "[UDP] Received data from:" << remote.address().to_string() << ":" << remote.port() << " TID:" << std::this_thread::get_id() <<" Size:"<<data.size() << "\nMessage: " << s << std::endl;
+    std::vector<std::uint8_t> resend(s.begin(), s.end());
+    server.send(remote, resend);
+}
 int main()
 {
-    asio::ip::tcp::endpoint endpoint(asio::ip::tcp::v4(), 7777);
-    TCPServer server(endpoint, false, 8);
+    TCPServer server(asio::ip::make_address("0.0.0.0"),7777, false, 8);
     server.addHandler(onError);
     server.addHandler(std::function<bool(std::shared_ptr<TCPConnection>)>(onConnect)); //disgusting, need to fix somehow
     server.addHandler(onDisconnect);
     server.addHandler(onData);
     bool running = true;
-    std::cout << "Running on port 7777\n";
+    std::cout << "[TCP] Running on " << server.ip << ":" << server.port << std::endl;
+    
+    UDPServer server2(asio::ip::make_address("0.0.0.0"),7777, 8);
+    server2.addHandler(udpData);
+    std::cout << "[UDP] Running on " << server2.ip << ":" << server2.port << std::endl;
     while (running == true)
     {
         std::string input;
