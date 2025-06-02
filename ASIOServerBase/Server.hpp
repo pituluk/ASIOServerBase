@@ -79,6 +79,7 @@ private:
 class TCPServer {
 	friend class TCPConnection;
 public:
+	std::atomic<bool> running = false;
 	asio::ip::address ip;
 	unsigned short port;
 	std::recursive_mutex conGuard;
@@ -87,6 +88,7 @@ public:
 	const asio::ip::tcp::endpoint endpoint;
 	TCPServer(const asio::ip::address& ip_, unsigned short port_, bool useProxy = false, std::size_t threads_ = 1);
 	~TCPServer();
+	void stop();
 	bool join(std::shared_ptr<TCPConnection> connection);
 	void leave(std::shared_ptr<TCPConnection> connection);
 	void addHandler(std::function<bool(std::error_code, std::string_view, std::optional<std::shared_ptr<TCPConnection>>, std::optional<asio::ip::tcp::socket*>)> errorCallback);
@@ -94,6 +96,7 @@ public:
 	void addHandler(std::function<void(std::shared_ptr<TCPConnection>)> disconnectCallback);
 	void addHandler(std::function<void(std::shared_ptr<TCPConnection>, const std::vector<std::uint8_t>&)> dataCallback);
 private:
+	asio::executor_work_guard<asio::io_context::executor_type> workGuard;
 	std::shared_mutex handlerGuard;
 	std::vector<std::function<bool(std::error_code, std::string_view, std::optional<std::shared_ptr<TCPConnection>>, std::optional<asio::ip::tcp::socket*>)>> errorCallbacks;
 	std::vector<std::function<bool(std::shared_ptr<TCPConnection>)>> connectCallbacks;

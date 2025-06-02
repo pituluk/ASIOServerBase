@@ -128,14 +128,16 @@ void TCPConnection::do_write() {
 
 // --- TCPServer implementation ---
 TCPServer::TCPServer(const asio::ip::address& ip_, unsigned short port_, bool useProxy, std::size_t threads_)
-	: ip(ip_), port(port_), acceptor(context, asio::ip::tcp::endpoint(ip_, port_)), threads(threads_), proxied(useProxy) {
+	: ip(ip_), port(port_), acceptor(context, asio::ip::tcp::endpoint(ip_, port_)), threads(threads_), proxied(useProxy), workGuard(asio::make_work_guard(context)){
 	for (std::size_t i = 0; i < threads; i++) {
 		threadPool.emplace_back([this]() { this->context.run(); });
 	}
 	do_accept();
+	running = true;
 }
 
 TCPServer::~TCPServer() {
+	std::unique_lock lock(conGuard); //is the lock necessary? I guess it is, because we are accessing connections, need to analyze this
 	for (auto connection : connections) {
 		connection->shutdown();
 	}
@@ -145,6 +147,20 @@ TCPServer::~TCPServer() {
 			thread.join();
 		}
 	}
+	running = false;
+}
+void TCPServer::stop() { //yes, its identical to destructor, but we want to be able to stop the server without destroying it I guess
+	std::unique_lock lock(conGuard);
+	for (auto connection : connections) {
+		connection->shutdown();
+	}
+	context.stop();
+	for (auto& thread : threadPool) {
+		if (thread.joinable()) {
+			thread.join();
+		}
+	}
+	running = false;
 }
 
 bool TCPServer::join(std::shared_ptr<TCPConnection> connection) {
