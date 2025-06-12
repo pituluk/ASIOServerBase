@@ -273,14 +273,14 @@ void TCPServer<ConnUserData, ServerUserData>::stop() {
 			connection->shutdown();
 		}
 	}
-	std::promise<void> shutdownDone;
-	serverStrand.post([this, &shutdownDone] {
-		acceptor.close();
-		workGuard.reset();
-		context.stop();
-		shutdownDone.set_value();
-		});
-	shutdownDone.get_future().wait();
+		std::promise<void> shutdownDone;
+		serverStrand.dispatch([this, &shutdownDone] {
+			acceptor.close();
+			workGuard.reset();
+			context.stop();
+			shutdownDone.set_value();
+			});
+		shutdownDone.get_future().wait();
 	running = false;
 	running.notify_all();
 }
