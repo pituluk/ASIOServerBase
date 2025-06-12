@@ -12,6 +12,7 @@
 #include <mutex>
 #include <algorithm>
 #include <variant>
+#include <memory>
 enum class proxyHeaderParseStatus {
 	SuccessProxy,
 	FailedSignature,
@@ -55,9 +56,9 @@ class TCPServer;
 
 template <typename ConnUserData = std::monostate, typename ServerUserData = std::monostate>
 class TCPConnection : public std::enable_shared_from_this<TCPConnection<ConnUserData, ServerUserData>> {
-	friend class TCPServer;
+	friend class TCPServer<ConnUserData, ServerUserData>;
 public:
-	using ServerType = TCPServer<ConnUserData, ServUserData>;
+	using ServerType = TCPServer<ConnUserData, ServerUserData>;
 	TCPConnection(std::uint64_t id_, asio::ip::tcp::socket socket_, TCPServer<ConnUserData, ServerUserData>* server_, asio::ip::address ip_, asio::ip::address realIP_, asio::io_context& io_context);
 	std::uint64_t id;
 	asio::ip::address ip;
@@ -80,7 +81,7 @@ private:
 };
 template<typename ConnUserData, typename ServerUserData>
 class TCPServer {
-	friend class TCPConnection;
+	friend class TCPConnection<ConnUserData, ServerUserData>;
 public:
 	using ConnectionType = TCPConnection<ConnUserData, ServerUserData>;
 	ServerUserData userData;
@@ -114,6 +115,7 @@ private:
 	void onData(std::shared_ptr<ConnectionType> connection, const std::vector<std::uint8_t> data);
 	std::atomic<std::uint64_t> idCounter = 0;
 	void do_accept();
+	asio::io_context::strand serverStrand;
 	asio::ip::tcp::acceptor acceptor;
 	bool proxied = false;
 	std::size_t threads = 1;
@@ -131,7 +133,7 @@ void TCPConnection<ConnUserData, ServerUserData>::start() {
 }
 template <typename ConnUserData, typename ServerUserData>
 void TCPConnection<ConnUserData, ServerUserData>::write(std::vector<std::uint8_t> data) {
-	auto self = shared_from_this();
+	auto self = this->shared_from_this();
 	if (disconnected)
 		return;
 	asio::post(strand, [this, self, data = std::move(data)]() {
@@ -145,7 +147,7 @@ void TCPConnection<ConnUserData, ServerUserData>::write(std::vector<std::uint8_t
 template <typename ConnUserData, typename ServerUserData>
 void TCPConnection<ConnUserData, ServerUserData>::disconnect() {
 	disconnected = true;
-	auto self = shared_from_this();
+	auto self = this->shared_from_this();
 	asio::post(strand, [this, self]() {
 		if (!write_queue.empty()) {
 			return;
@@ -154,7 +156,7 @@ void TCPConnection<ConnUserData, ServerUserData>::disconnect() {
 			socket.shutdown(asio::socket_base::shutdown_both);
 			socket.close();
 		}
-		server->leave(shared_from_this());
+		server->leave(this->shared_from_this());
 		});
 }
 template <typename ConnUserData, typename ServerUserData>
@@ -164,7 +166,7 @@ void TCPConnection<ConnUserData, ServerUserData>::shutdown() {
 		return;
 	}
 	disconnected = true;
-	auto self = shared_from_this();
+	auto self = this->shared_from_this();
 	asio::dispatch(strand, [this, self]() {
 		if (socket.is_open()) {
 			socket.shutdown(asio::socket_base::shutdown_both);
@@ -178,7 +180,7 @@ void TCPConnection<ConnUserData, ServerUserData>::do_read() {
 	{
 		return;
 	}
-	auto self = shared_from_this();
+	auto self = this->shared_from_this();
 
 	auto buf = asio::buffer(this->read_buffer.data(), this->read_buffer.size());
 	socket.async_read_some(
@@ -199,7 +201,7 @@ void TCPConnection<ConnUserData, ServerUserData>::do_read() {
 }
 template <typename ConnUserData, typename ServerUserData>
 void TCPConnection<ConnUserData, ServerUserData>::do_write() {
-	auto self = shared_from_this();
+	auto self = this->shared_from_this();
 	asio::async_write(
 		socket,
 		asio::buffer(write_queue.front()),
@@ -225,10 +227,24 @@ void TCPConnection<ConnUserData, ServerUserData>::do_write() {
 // --- TCPServer implementation ---
 template <typename ConnUserData, typename ServerUserData>
 TCPServer<ConnUserData, ServerUserData>::TCPServer(const asio::ip::address& ip_, unsigned short port_, bool useProxy, std::size_t threads_)
-	: ip(ip_), port(port_), acceptor(context, asio::ip::tcp::endpoint(ip_, port_)), threads(threads_), proxied(useProxy), workGuard(asio::make_work_guard(context)) {
+	: ip(ip_), port(port_), acceptor(context, asio::ip::tcp::endpoint(ip_, port_)), threads(threads_), proxied(useProxy), workGuard(asio::make_work_guard(context)), serverStrand(context) {
 	for (std::size_t i = 0; i < threads; i++) {
 		threadPool.emplace_back([this]() {
-			this->context.run();
+			try {
+				this->context.run();
+			}
+			catch (const std::system_error& ex)
+			{
+				onError(ex.code(), std::string("context.run(): ") + ex.what());
+			}
+			catch (const std::exception& ex)
+			{
+				onError(std::make_error_code(std::errc::interrupted), std::string("context.run(): ") + ex.what());
+			}
+			catch (...)
+			{
+				onError(std::make_error_code(std::errc::invalid_argument), "Unknown error from context.run();");
+			}
 			});
 	}
 	do_accept();
@@ -236,30 +252,37 @@ TCPServer<ConnUserData, ServerUserData>::TCPServer(const asio::ip::address& ip_,
 }
 template <typename ConnUserData, typename ServerUserData>
 TCPServer<ConnUserData, ServerUserData>::~TCPServer() {
-	std::unique_lock lock(conGuard);
-	for (auto connection : connections) {
-		connection->shutdown();
-	}
-	context.stop();
-	for (auto& thread : threadPool) {
-		if (thread.joinable()) {
-			thread.join();
-		}
-	}
-}
-template <typename ConnUserData, typename ServerUserData>
-void TCPServer<ConnUserData, ServerUserData>::stop() {
-	std::unique_lock lock(conGuard);
-	for (auto connection : connections) {
-		connection->shutdown();
-	}
-	context.stop();
+	stop();
 	for (auto& thread : threadPool) {
 		if (thread.joinable()) {
 			thread.join();
 		}
 	}
 	running = false;
+	running.notify_all();
+}
+template <typename ConnUserData, typename ServerUserData>
+void TCPServer<ConnUserData, ServerUserData>::stop() {
+	if (!running)
+	{
+		return;
+	}
+	{
+		std::unique_lock lock(conGuard);
+		for (auto connection : connections) {
+			connection->shutdown();
+		}
+	}
+	std::promise<void> shutdownDone;
+	serverStrand.post([this, &shutdownDone] {
+		acceptor.close();
+		workGuard.reset();
+		context.stop();
+		shutdownDone.set_value();
+		});
+	shutdownDone.get_future().wait();
+	running = false;
+	running.notify_all();
 }
 template <typename ConnUserData, typename ServerUserData>
 bool TCPServer<ConnUserData, ServerUserData>::join(std::shared_ptr<TCPConnection<ConnUserData, ServerUserData>> connection) {
@@ -338,41 +361,43 @@ void TCPServer<ConnUserData, ServerUserData>::onData(std::shared_ptr<TCPConnecti
 }
 template <typename ConnUserData, typename ServerUserData>
 void TCPServer<ConnUserData, ServerUserData>::do_accept() {
-	acceptor.async_accept(
-		[this](std::error_code ec, asio::ip::tcp::socket socket) {
-			if (!ec) {
-				std::uint64_t connectionID = idCounter.fetch_add(1);
-				asio::ip::address ip = socket.remote_endpoint().address();
-				asio::ip::address realIP;
-				if (!proxied) {
-					realIP = ip;
-				}
-				else {
-					proxyHeader proxyheader;
-					read_proxy_header(&socket, proxyheader);
-					auto status = proxyheader.decode_header();
-					if (status == proxyHeaderParseStatus::SuccessProxy) {
-						realIP = asio::ip::make_address_v4(proxyheader.src_addr);
+	serverStrand.post([this] {
+		acceptor.async_accept(
+			[this](std::error_code ec, asio::ip::tcp::socket socket) {
+				if (!ec) {
+					std::uint64_t connectionID = idCounter.fetch_add(1);
+					asio::ip::address ip = socket.remote_endpoint().address();
+					asio::ip::address realIP;
+					if (!proxied) {
+						realIP = ip;
 					}
 					else {
-						onError(std::make_error_code(std::errc::invalid_argument), "Proxy header failed " + std::to_string(static_cast<int>(status)), std::nullopt, &socket);
-						return;
+						proxyHeader proxyheader;
+						read_proxy_header(&socket, proxyheader);
+						auto status = proxyheader.decode_header();
+						if (status == proxyHeaderParseStatus::SuccessProxy) {
+							realIP = asio::ip::make_address_v4(proxyheader.src_addr);
+						}
+						else {
+							onError(std::make_error_code(std::errc::invalid_argument), "Proxy header failed " + std::to_string(static_cast<int>(status)), std::nullopt, &socket);
+							return;
+						}
+					}
+					auto conn = std::make_shared<ConnectionType>(connectionID, std::move(socket), this, ip, realIP, context);
+					bool allowed = join(conn);
+					if (allowed) {
+						conn->start();
+					}
+					else {
+						onError(std::make_error_code(std::errc::permission_denied), "Connection not allowed", conn, std::nullopt);
+						conn->shutdown();
 					}
 				}
-				auto conn = std::make_shared<TCPConnection>(connectionID, std::move(socket), this, ip, realIP, context);
-				bool allowed = join(conn);
-				if (allowed) {
-					conn->start();
-				}
 				else {
-					onError(std::make_error_code(std::errc::permission_denied), "Connection not allowed", conn, std::nullopt);
-					conn->shutdown();
+					onError(ec, "Accept failed", std::nullopt, &socket);
 				}
-			}
-			else {
-				onError(ec, "Accept failed", std::nullopt, &socket);
-			}
-			do_accept();
+				do_accept();
+			});
 		});
 }
 
