@@ -1,11 +1,11 @@
 ﻿#include <iostream>
-#include "Server.hpp"
+#include "ServerImpl.hpp"
 #include <chrono>
 std::uint32_t getTimeSeconds()
 {
     return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
-bool onError(std::error_code ec, std::string_view message, std::optional<std::shared_ptr<TCPConnection>> connection, std::optional<asio::ip::tcp::socket*> socket)
+bool onError(std::error_code ec, std::string_view message, std::optional<std::shared_ptr<Connection>> connection, std::optional<asio::ip::tcp::socket*> socket)
 {
     std::cout << "Error: " << message << " - " << ec.message() << std::endl;
     if (connection) {
@@ -16,23 +16,15 @@ bool onError(std::error_code ec, std::string_view message, std::optional<std::sh
     }
     return true; // Continue processing
 }
-struct userData {
-    std::uint32_t connectedOn;
-    std::string name;
-    std::vector<std::uint8_t> buffer;
-    size_t read_offset = 0;
-};
-bool onConnect(std::shared_ptr<TCPConnection> connection)
+bool onConnect(std::shared_ptr<Connection> connection)
 {
     std::cout << "New connection established. "<<connection->realIP<< " ID" << connection->id << std::endl;
-    connection->userData = userData{};
-    auto& udr = std::any_cast<userData&>(connection->userData);
-    udr.connectedOn = getTimeSeconds();
-    udr.name = "User" + std::to_string(connection->id);
-    udr.buffer.reserve(65535);
+    connection->userData.connectedOn = getTimeSeconds();
+    connection->userData.name = "User" + std::to_string(connection->id);
+    connection->userData.buffer.reserve(65535);
     return true; // Allow connection
 }
-void onDisconnect(std::shared_ptr<TCPConnection> connection) {
+void onDisconnect(std::shared_ptr<Connection> connection) {
     std::cout << "Connection ID: " << connection->id << " disconnected." << std::endl;
 }
 void onPacket(const std::vector<std::uint8_t>& packet)
@@ -40,10 +32,10 @@ void onPacket(const std::vector<std::uint8_t>& packet)
     std::string s(packet.begin(), packet.end());
     std::cout << "[1] Parsed packet of size: " << packet.size() << std::endl;
 }
-void onData(std::shared_ptr<TCPConnection> connection, const std::vector<std::uint8_t>& data) {
-    auto& ud = std::any_cast<userData&>(connection->userData);
-    auto& buffer = ud.buffer;
-    auto& read_offset = ud.read_offset;
+void onData(std::shared_ptr<Connection> connection, const std::vector<std::uint8_t>& data) {
+    
+    auto& buffer = connection->userData.buffer;
+    auto& read_offset = connection->userData.read_offset;
     constexpr size_t headerSize = 4;
     constexpr size_t maxPacketSize = 65535;
 
@@ -92,9 +84,9 @@ void udpData(UDPServer& server,const asio::ip::udp::endpoint& remote, const std:
 }
 int main()
 {
-    TCPServer server(asio::ip::make_address("0.0.0.0"),7777, false, 8);
+    Server server(asio::ip::make_address("0.0.0.0"),7777, false, 8);
     server.addHandler(onError);
-    server.addHandler(std::function<bool(std::shared_ptr<TCPConnection>)>(onConnect)); //disgusting, need to fix somehow
+    server.addHandler(std::function<bool(std::shared_ptr<Connection>)>(onConnect)); //disgusting, need to fix somehow
     server.addHandler(onDisconnect);
     server.addHandler(onData);
     bool running = true;
