@@ -37,10 +37,18 @@ proxyHeaderParseStatus proxyHeader::decode_header() {
 }
 
 UDPServer::UDPServer(const asio::ip::address& ip_, unsigned short port_, std::size_t threads_)
-	: ip(ip_), port(port_), socket(context, asio::ip::udp::endpoint(ip_, port_)), threads(threads_), recvBuffer(65535) {
+	: workGuard(asio::make_work_guard(context)), ip(ip_), port(port_), socket(context, asio::ip::udp::endpoint(ip_, port_)), threads(threads_), recvBuffer(65535) {
 	for (size_t i = 0; i < threads; i++)
 	{
-		threadPool.emplace_back([this]() { context.run(); });
+		threadPool.emplace_back([this]() {
+			try {
+				context.run();
+			}
+			catch (const std::exception& ec)
+			{
+				std::cout << ec.what(); //TBD
+			}
+			});
 	}
 	start_receive();
 }

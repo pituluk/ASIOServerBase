@@ -1,9 +1,13 @@
 ﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
-VisualStudioVersion = 17.13.35825.156 d17.13
+VisualStudioVersion = 17.13.35825.156
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ASIOServerBase", "ASIOServerBase\ASIOServerBase.vcxproj", "{934DE9C2-958C-429B-88B5-E78802215F6B}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Shared", "Shared\Shared.vcxitems", "{2AC4476B-654B-4DD6-A51E-12B5651938C1}"
+EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "TestClient", "TestClient\TestClient.vcxproj", "{90240FA7-0374-4446-B46D-CD3EF070DCFC}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -21,11 +25,23 @@ Global
 		{934DE9C2-958C-429B-88B5-E78802215F6B}.Release|x64.Build.0 = Release|x64
 		{934DE9C2-958C-429B-88B5-E78802215F6B}.Release|x86.ActiveCfg = Release|Win32
 		{934DE9C2-958C-429B-88B5-E78802215F6B}.Release|x86.Build.0 = Release|Win32
+		{90240FA7-0374-4446-B46D-CD3EF070DCFC}.Debug|x64.ActiveCfg = Debug|x64
+		{90240FA7-0374-4446-B46D-CD3EF070DCFC}.Debug|x64.Build.0 = Debug|x64
+		{90240FA7-0374-4446-B46D-CD3EF070DCFC}.Debug|x86.ActiveCfg = Debug|Win32
+		{90240FA7-0374-4446-B46D-CD3EF070DCFC}.Debug|x86.Build.0 = Debug|Win32
+		{90240FA7-0374-4446-B46D-CD3EF070DCFC}.Release|x64.ActiveCfg = Release|x64
+		{90240FA7-0374-4446-B46D-CD3EF070DCFC}.Release|x64.Build.0 = Release|x64
+		{90240FA7-0374-4446-B46D-CD3EF070DCFC}.Release|x86.ActiveCfg = Release|Win32
+		{90240FA7-0374-4446-B46D-CD3EF070DCFC}.Release|x86.Build.0 = Release|Win32
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
 	EndGlobalSection
 	GlobalSection(ExtensibilityGlobals) = postSolution
 		SolutionGuid = {AEAE897C-F094-4B21-B383-F2C7BA9278CE}
+	EndGlobalSection
+	GlobalSection(SharedMSBuildProjectFiles) = preSolution
+		Shared\Shared.vcxitems*{2ac4476b-654b-4dd6-a51e-12b5651938c1}*SharedItemsImports = 9
+		Shared\Shared.vcxitems*{934de9c2-958c-429b-88b5-e78802215f6b}*SharedItemsImports = 4
 	EndGlobalSection
 EndGlobal
