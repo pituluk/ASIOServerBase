@@ -1,6 +1,6 @@
-﻿#include <iostream>
-#include "ServerImpl.hpp"
+﻿#include "ServerImpl.hpp"
 #include <chrono>
+#include <iostream>
 
 void udpOnData(UDPServer& server, const asio::ip::udp::endpoint& remote, const std::vector<std::uint8_t>& data)
 {
@@ -11,7 +11,7 @@ void udpOnData(UDPServer& server, const asio::ip::udp::endpoint& remote, const s
 }
 int main()
 {
-	Server server(asio::ip::make_address("0.0.0.0"), 7777, false, 8);
+	Server server(asio::ip::make_address("0.0.0.0"), 7777, 8, false);
 	bool running = true;
 	std::cout << "[TCP] Running on " << server.ip << ":" << server.port << std::endl;
 

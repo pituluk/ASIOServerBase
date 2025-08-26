@@ -1,7 +1,7 @@
 #include "Server.hpp"
-#include <ranges>
 #include <algorithm>
 #include <iostream>
+#include <ranges>
 // --- proxyHeader implementation 
 
 size_t proxyHeader::size() { return bsize; }
@@ -35,6 +35,188 @@ proxyHeaderParseStatus proxyHeader::decode_header() {
 	}
 	return proxyHeaderParseStatus::SuccessProxy;
 }
+
+
+TCPServer::TCPServer(const asio::ip::address& ip_, unsigned short port_, std::unique_ptr<ConnectionFactory> factory, std::size_t threads_, bool useProxy)
+	: ip(ip_), port(port_), acceptor(context, asio::ip::tcp::endpoint(ip_, port_)), threads(threads_), proxied(useProxy), workGuard(asio::make_work_guard(context)), serverStrand(context), connectionFactory(std::move(factory))
+{
+	if (!connectionFactory)
+	{
+		throw std::runtime_error("Factory is required.");
+	}
+	assert(threads_ > 0);
+}
+
+TCPServer::~TCPServer() {
+	stop();
+	for (auto& thread : threadPool) {
+		if (thread.joinable()) {
+			thread.join();
+		}
+	}
+	running = false;
+	running.notify_all();
+}
+
+void TCPServer::start()
+{
+	if (running)
+	{
+		return;
+	}
+	for (std::size_t i = 0; i < threads; i++) {
+		threadPool.emplace_back([this]() {
+			try
+			{
+				this->context.run();
+			}
+			catch (const std::system_error& ex)
+			{
+				onError(ex.code(), std::string("context.run(): ") + ex.what());
+			}
+			catch (const std::exception& ex)
+			{
+				onError(std::make_error_code(std::errc::interrupted), std::string("context.run(): ") + ex.what());
+			}
+			catch (...)
+			{
+				onError(std::make_error_code(std::errc::invalid_argument), "Unknown error from context.run()");
+			}
+			});
+	}
+	do_accept();
+	running = true;
+}
+
+void TCPServer::stop() {
+	if (!running)
+	{
+		return;
+	}
+	{
+		std::unique_lock lock(conGuard);
+		for (auto connection : connections) {
+			connection->shutdown();
+		}
+	}
+	std::promise<void> shutdownDone;
+	serverStrand.dispatch([this, &shutdownDone] {
+		acceptor.close();
+		workGuard.reset();
+		context.stop();
+		shutdownDone.set_value();
+		});
+	shutdownDone.get_future().wait();
+	running = false;
+	running.notify_all();
+}
+
+bool TCPServer::join(ConnectionPtr connection) {
+	if (onConnect(connection)) {
+		std::lock_guard<std::recursive_mutex> lock(conGuard);
+		connections.push_back(connection);
+		return true;
+	}
+	else {
+		return false;
+	}
+}
+
+void TCPServer::leave(ConnectionPtr connection) {
+	std::lock_guard<std::recursive_mutex> lock(conGuard);
+	auto it = std::find(connections.begin(), connections.end(), connection);
+	if (it != connections.end()) {
+		connections.erase(it);
+	}
+}
+
+void TCPServer::addErrorHandler(std::function<bool(std::error_code, std::string_view, ConnectionPtr, asio::ip::tcp::socket*)> errorCallback) {
+	std::unique_lock lock(handlerGuard);
+	callbacks.onError.push_back(errorCallback);
+}
+
+void TCPServer::addConnectHandler(std::function<bool(ConnectionPtr)> connectCallback) {
+	std::unique_lock lock(handlerGuard);
+	callbacks.onConnect.push_back(connectCallback);
+}
+
+void TCPServer::addDisconnectHandler(std::function<void(ConnectionPtr)> disconnectCallback) {
+	std::unique_lock lock(handlerGuard);
+	callbacks.onDisconnect.push_back(disconnectCallback);
+}
+
+bool TCPServer::onError(std::error_code ec, std::string_view message, ConnectionPtr connection, asio::ip::tcp::socket* socket) {
+	std::shared_lock lock(handlerGuard);
+	bool ret = true;
+	for (const auto& callback : callbacks.onError) {
+		if (!callback(ec, message, connection, socket)) {
+			ret = false;
+		}
+	}
+	return ret;
+}
+bool TCPServer::onConnect(ConnectionPtr connection) {
+	std::shared_lock lock(handlerGuard);
+	for (const auto& callback : callbacks.onConnect) {
+		if (!callback(connection)) {
+			return false;
+		}
+	}
+	return true;
+}
+void TCPServer::onDisconnect(ConnectionPtr connection) {
+	leave(connection);
+	std::shared_lock lock(handlerGuard);
+	for (const auto& callback : callbacks.onDisconnect) {
+		callback(connection);
+	}
+}
+
+void TCPServer::do_accept() {
+	serverStrand.post([this] {
+		acceptor.async_accept(
+			[this](std::error_code ec, asio::ip::tcp::socket socket) {
+				if (!ec) {
+					socket.lowest_layer().set_option(asio::ip::tcp::no_delay(true));
+					asio::ip::address ip = socket.remote_endpoint().address();
+					asio::ip::address realIP;
+					if (!proxied) {
+						realIP = ip;
+					}
+					else {
+						proxyHeader proxyheader;
+						proxyHeader::read_proxy_header(&socket, proxyheader);
+						auto status = proxyheader.decode_header();
+						if (status == proxyHeaderParseStatus::SuccessProxy) {
+							realIP = asio::ip::make_address_v4(proxyheader.src_addr);
+						}
+						else {
+							onError(std::make_error_code(std::errc::invalid_argument), "Proxy header failed " + std::to_string(static_cast<int>(status)), nullptr, &socket);
+							return;
+						}
+					}
+					ConnectionPtr conn = connectionFactory->create(std::move(socket), context, ip, realIP);
+					conn->onErrorCb = [this, conn](std::error_code ec, std::string_view message) {this->onError(ec, message, conn); };
+					conn->onDisconnectCb = [this, conn]() {this->onDisconnect(conn); };
+					bool allowed = join(conn);
+					if (allowed) {
+						conn->start();
+					}
+					else {
+						onError(std::make_error_code(std::errc::permission_denied), "Connection not allowed", conn, nullptr);
+						conn->shutdown();
+					}
+				}
+				else {
+					onError(ec, "Accept failed", nullptr, &socket);
+				}
+				do_accept();
+			});
+		});
+}
+
+
+
 
 UDPServer::UDPServer(const asio::ip::address& ip_, unsigned short port_, std::size_t threads_)
 	: workGuard(asio::make_work_guard(context)), ip(ip_), port(port_), socket(context, asio::ip::udp::endpoint(ip_, port_)), threads(threads_), recvBuffer(65535) {

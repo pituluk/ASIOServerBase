@@ -28,7 +28,10 @@ protected:
 	{
 		auto& buf = b.getBuffer();
 		std::uint32_t size = buf.size();
-		memcpy(&(buf[0]), &size, sizeof(std::uint32_t)); //ugly but works
+		buf[0] = static_cast<uint8_t>((size >> 24) & 0xFF);
+		buf[1] = static_cast<uint8_t>((size >> 16) & 0xFF);
+		buf[2] = static_cast<uint8_t>((size >> 8) & 0xFF);
+		buf[3] = static_cast<uint8_t>((size) & 0xFF);
 	}
 	void read() { //called only from constructors
 		try {
@@ -41,6 +44,5 @@ protected:
 	}
 	virtual void _read() = 0;
 	Buffer b;
-	std::uint8_t encryptionKey = 0;
 	bool readSuccess = true;
 };

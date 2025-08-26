@@ -1,19 +1,18 @@
 #pragma once
-#include <third_party/asio.hpp>
-#include <cstdint>
-#include <any>
-#include <vector>
-#include <array>
-#include <deque>
-#include <shared_mutex>
-#include <atomic>
-#include <thread>
-#include <mutex>
-#include <optional>
 #include <algorithm>
-#include <variant>
-#include <memory>
+#include <array>
+#include <asio.hpp>
+#include <asio/ssl.hpp>
+#include <atomic>
 #include <concepts>
+#include <cstdint>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <shared_mutex>
+#include <thread>
+#include <variant>
+#include <vector>
 enum class proxyHeaderParseStatus {
 	SuccessProxy,
 	FailedSignature,
@@ -50,95 +49,261 @@ public:
 	char* data();
 	void clear();
 	proxyHeaderParseStatus decode_header();
+	static void read_proxy_header(asio::ip::tcp::socket* s, proxyHeader& header) {
+		asio::read(*s, asio::buffer(header.data(), header.size()));
+	}
 };
 
-
-template <typename Derived>
-struct ConnectionCallbacks {
-	std::function<void(std::error_code, std::string_view, std::shared_ptr<Derived> connection)> onError;
-	std::function<void(std::shared_ptr<Derived>)> onDisconnect;
-	std::function<void(std::shared_ptr<Derived>, std::vector<std::uint8_t>)> onData;
-};
-
-template<typename Derived>
-class TCPConnection : public std::enable_shared_from_this<Derived> {
-	template <typename T>
-	friend class TCPServer;
+class IConnection : public std::enable_shared_from_this<IConnection> {
 public:
-	TCPConnection(std::uint64_t id_, asio::ip::tcp::socket socket_, asio::ip::address ip_, asio::ip::address realIP_, asio::io_context& io_context);
-	TCPConnection(const TCPConnection&) = delete;
-	TCPConnection& operator=(const TCPConnection&) = delete;
-	std::uint64_t id;
+	virtual ~IConnection() = default;
+	virtual void start() = 0;
+	virtual void write(std::vector<std::uint8_t> data) = 0;
+	virtual void disconnect() = 0;
+	virtual void shutdown() = 0;
+	virtual void onError(std::error_code ec, std::string_view message) {
+		onErrorCb(ec, message);
+	}
+	virtual void onData(const std::vector<std::uint8_t>& data) { return; }
+protected:
+	std::function<void(std::error_code ec, std::string_view message)> onErrorCb;
+	std::function<void()> onDisconnectCb;
+	friend class TCPServer;
+};
+template<typename Stream>
+class BaseConnection : public IConnection {
+public:
+	BaseConnection(Stream stream_, asio::io_context& io_context, asio::ip::address ip_, asio::ip::address realIP_)
+		: stream(std::move(stream_)), strand(io_context), ip(ip_), realIP(realIP_), read_buffer(65535) {
+	}
+
 	asio::ip::address ip;
 	asio::ip::address realIP;
 	asio::io_context::strand strand;
-	void start();
-	void write(std::vector<std::uint8_t> data);
-	void disconnect();
-	void shutdown();
-	std::shared_ptr<Derived> self() {
-		return this->shared_from_this();
+	std::atomic<bool> disconnected = false;
+
+	virtual void start() override {
+		this->do_read();
+	}
+
+	void write(std::vector<std::uint8_t> data) override {
+		auto self = this->shared_from_this();
+		if (this->disconnected)
+			return;
+		asio::post(this->strand, [this, self, data = std::move(data)]() {
+			bool write_in_progress = !this->write_queue.empty();
+			this->write_queue.push_back(std::move(data));
+			if (!write_in_progress) {
+				this->do_write();
+			}
+			});
+	}
+
+	void disconnect() override {
+		this->disconnected = true;
+		auto self = this->shared_from_this();
+		asio::dispatch(this->strand, [this, self]() {
+			if (!this->write_queue.empty()) return;
+			if (this->lowest_layer().is_open()) {
+				this->lowest_layer().cancel();
+				this->lowest_layer().shutdown(asio::socket_base::shutdown_both);
+				this->lowest_layer().close();
+			}
+			this->onDisconnectCb();
+			});
+	}
+
+	void shutdown() override {
+		if (this->disconnected) return;
+		this->disconnected = true;
+		auto self = this->shared_from_this();
+		asio::dispatch(this->strand, [this, self]() {
+			if (this->lowest_layer().is_open()) {
+				this->lowest_layer().shutdown(asio::socket_base::shutdown_both);
+				this->lowest_layer().close();
+			}
+			});
+	}
+
+	template <typename Func>
+	auto executeAfter(std::chrono::steady_clock::duration delay, Func&& func)
+		-> std::future<std::invoke_result_t<Func>>
+	{
+		using ReturnT = std::invoke_result_t<Func>;
+
+		return asio::co_spawn(
+			strand.context(),
+			asio::bind_executor(strand,
+				[delay, func = std::move(func)]() mutable -> asio::awaitable<ReturnT> {
+					asio::steady_timer timer{ co_await asio::this_coro::executor };
+					timer.expires_after(delay);
+
+					asio::error_code ec;
+					co_await timer.async_wait(asio::redirect_error(asio::use_awaitable, ec));
+
+					if (ec)
+						throw std::runtime_error(ec.message());
+
+					co_return func();
+				}),
+			asio::use_future
+		);
 	}
 protected:
-	void setCallbacks(ConnectionCallbacks<Derived> cb) { callbacks = std::move(cb); }
-	ConnectionCallbacks<Derived> callbacks;
-	TCPConnection() = default;
+	virtual void onData(const std::vector<std::uint8_t>& data) override {}
+
+	Stream& get_stream() { return stream; }
+	typename Stream::lowest_layer_type& lowest_layer() { return stream.lowest_layer(); }
+
 private:
-	void onDisconnect() {
-		if (callbacks.onDisconnect)
-		{
-			callbacks.onDisconnect(self());
-		}
-	}
-	void onError(std::error_code ec, std::string_view message)
-	{
-		if (callbacks.onError)
-		{
-			callbacks.onError(ec, message, self());
-		}
-	}
-	void onData(std::vector<std::uint8_t> data)
-	{
-		if (callbacks.onData)
-		{
-			callbacks.onData(self(), std::move(data));
-		}
-	}
-	std::atomic<bool> disconnected = false;
-	asio::ip::tcp::socket socket;
-	void do_read();
-	void do_write();
 	std::deque<std::vector<std::uint8_t>> write_queue;
 	std::vector<std::uint8_t> read_buffer;
+	Stream stream;
+
+	void do_read() {
+		if (this->disconnected) return;
+
+		auto self = this->shared_from_this();
+		auto buf = asio::buffer(this->read_buffer.data(), this->read_buffer.size());
+
+		stream.async_read_some(buf,
+			asio::bind_executor(this->strand,
+				[this, self](const std::error_code& ec, std::size_t length) {
+					if (!ec && length > 0) {
+						std::vector<std::uint8_t> data(this->read_buffer.begin(), this->read_buffer.begin() + length);
+						this->onData(std::move(data));
+						this->do_read();
+					}
+					else if (ec != asio::error::operation_aborted) {
+						if (!this->disconnected) this->disconnect();
+					}
+				}));
+	}
+
+	void do_write() {
+		auto self = this->shared_from_this();
+		asio::async_write(stream,
+			asio::buffer(this->write_queue.front()),
+			asio::bind_executor(this->strand,
+				[this, self](std::error_code ec, std::size_t /*length*/) {
+					if (!ec) {
+						this->write_queue.pop_front();
+						if (!this->write_queue.empty()) {
+							this->do_write();
+						}
+						else if (this->disconnected) {
+							this->disconnect();
+						}
+					}
+					else {
+						this->onError(ec, "Write failed");
+						this->disconnect();
+					}
+				}));
+	}
+};
+
+class TCPConnection : public BaseConnection<asio::ip::tcp::socket> {
+public:
+	using Base = BaseConnection<asio::ip::tcp::socket>;
+	TCPConnection(asio::ip::tcp::socket socket_, asio::io_context& io_context, asio::ip::address ip_, asio::ip::address realIP_)
+		: Base(std::move(socket_), io_context, ip_, realIP_) {
+	}
+};
+
+class SSLConnection : public BaseConnection<asio::ssl::stream<asio::ip::tcp::socket>> {
+public:
+	SSLConnection(asio::ip::tcp::socket socket_, asio::io_context& io_context,
+		asio::ssl::context& ssl_context, asio::ip::address ip_, asio::ip::address realIP_)
+		: BaseConnection(asio::ssl::stream<asio::ip::tcp::socket>(std::move(socket_), ssl_context),
+			io_context, ip_, realIP_) {
+	}
+	//If you inherit make sure to call start of the class you inherited from.
+	void start() override {
+		auto self = this->shared_from_this();
+		this->get_stream().async_handshake(asio::ssl::stream_base::server,
+			asio::bind_executor(this->strand, [this, self](const std::error_code& ec) {
+				if (!ec) {
+					this->BaseConnection::start();  // proceed to do_read()
+				}
+				else {
+					this->onError(ec, "<SSLConnection::start> SSL Handshake failed");
+					this->disconnect();
+				}
+				}));
+	}
+
+};
+
+class ConnectionFactory {
+public:
+	virtual ~ConnectionFactory() = default;
+	virtual std::shared_ptr<IConnection> create(asio::ip::tcp::socket socket, asio::io_context& io_context, asio::ip::address ip, asio::ip::address realIP)
+	{
+		return std::make_shared<TCPConnection>(std::move(socket), io_context, ip, realIP);
+	};
+};
+
+struct SSLInitContext
+{
+	SSLInitContext(const std::vector<std::uint8_t>& chain_file, const std::vector<std::uint8_t>& private_key_file, const std::vector<std::vector<std::uint8_t>>& ca_file, asio::ssl::context::file_format file_format = asio::ssl::context::pem, asio::ssl::context::method ssl_method = asio::ssl::context::tlsv12_server)
+		: chain_file(chain_file), private_key_file(private_key_file), ca_file(ca_file), ssl_method(ssl_method), file_format(file_format)
+	{
+		assert(chain_file.size() > 0);
+		assert(private_key_file.size() > 0);
+	}
+	const asio::ssl::context::method ssl_method;
+	const std::vector<std::uint8_t>& chain_file;
+	const std::vector<std::uint8_t>& private_key_file;
+	const std::vector<std::vector<std::uint8_t>>& ca_file;
+	const asio::ssl::context::file_format file_format;
+};
+class SSLConnectionFactory : public ConnectionFactory {
+public:
+	SSLConnectionFactory(SSLInitContext sslData) : ssl_ctx(sslData.ssl_method)
+	{
+		ssl_ctx.use_certificate_chain(asio::buffer(sslData.chain_file));
+		ssl_ctx.use_private_key(asio::buffer(sslData.private_key_file), sslData.file_format);
+		if (!sslData.ca_file.empty()) {
+			for (const auto& cert : sslData.ca_file)
+			{
+				if (!cert.empty()) {
+					ssl_ctx.add_certificate_authority(asio::buffer(cert));
+				}
+			}
+		}
+		ssl_ctx.set_verify_mode(asio::ssl::verify_peer | asio::ssl::verify_fail_if_no_peer_cert);
+	}
+	virtual ~SSLConnectionFactory() = default;
+	std::shared_ptr<IConnection> create(asio::ip::tcp::socket socket, asio::io_context& io_context, asio::ip::address ip, asio::ip::address realIP) override
+	{
+		return std::make_shared<SSLConnection>(std::move(socket), io_context, ssl_ctx, ip, realIP);
+	};
+protected:
+	asio::ssl::context ssl_ctx;
 };
 
 
-
-template<typename ConnectionType>
 class TCPServer {
-	static_assert(std::is_base_of_v<TCPConnection<ConnectionType>, ConnectionType>, "ConnectionType must derive from TCPConnection");
+	using ConnectionPtr = std::shared_ptr<IConnection>;
+	struct ServerCallbacks {
+		std::vector<std::function<bool(std::error_code, std::string_view, ConnectionPtr, asio::ip::tcp::socket*)>> onError;
+		std::vector<std::function<bool(ConnectionPtr)>> onConnect;
+		std::vector<std::function<void(ConnectionPtr)>> onDisconnect;
+	};
 public:
-	using ConnectionPtr = std::shared_ptr<ConnectionType>;
-	TCPServer(const asio::ip::address& ip_, unsigned short port_, bool useProxy = false, std::size_t threads_ = 1);
+	TCPServer(const asio::ip::address& ip_, unsigned short port_, std::unique_ptr<ConnectionFactory> factory = std::make_unique<ConnectionFactory>(), std::size_t threads_ = 1, bool useProxy = false);
 	TCPServer(const TCPServer&) = delete;
 	TCPServer& operator=(const TCPServer&) = delete;
 	~TCPServer();
-
-
-	struct ServerCallbacks {
-		std::vector<std::function<bool(std::error_code, std::string_view, std::optional<ConnectionPtr>, std::optional<asio::ip::tcp::socket*>)>> onError;
-		std::vector<std::function<bool(ConnectionPtr)>> onConnect;
-		std::vector<std::function<void(ConnectionPtr)>> onDisconnect;
-		std::vector<std::function<void(ConnectionPtr, const std::vector<std::uint8_t>&)>> onData;
-	};
 	void start();
 	void stop();
 	bool join(ConnectionPtr connection);
 	void leave(ConnectionPtr connection);
-	void addErrorHandler(std::function<bool(std::error_code, std::string_view, std::optional<ConnectionPtr>, std::optional<asio::ip::tcp::socket*>)> errorCallback);
+	void addErrorHandler(std::function<bool(std::error_code, std::string_view, ConnectionPtr, asio::ip::tcp::socket*)> errorCallback);
 	void addConnectHandler(std::function<bool(ConnectionPtr)> connectCallback);
 	void addDisconnectHandler(std::function<void(ConnectionPtr)> disconnectCallback);
-	void addDataHandler(std::function<void(ConnectionPtr, const std::vector<std::uint8_t>&)> dataCallback);
+
 
 	std::atomic<bool> running = false;
 	asio::io_context context;
@@ -148,325 +313,22 @@ public:
 	std::vector<ConnectionPtr> connections;
 	std::vector<std::thread> threadPool;
 	const asio::ip::tcp::endpoint endpoint;
+	std::size_t threads = 1;
 protected:
 	TCPServer() = default;
 private:
+	bool onError(std::error_code ec, std::string_view message, ConnectionPtr connection = nullptr, asio::ip::tcp::socket* socket = nullptr);
+	bool onConnect(ConnectionPtr connection);
+	void onDisconnect(ConnectionPtr connection);
+	void do_accept();
+	std::unique_ptr<ConnectionFactory> connectionFactory;
 	asio::executor_work_guard<asio::io_context::executor_type> workGuard;
 	std::shared_mutex handlerGuard;
 	ServerCallbacks callbacks;
-	bool onError(std::error_code ec, std::string_view message = "", std::optional<ConnectionPtr> connection = std::nullopt, std::optional<asio::ip::tcp::socket*> socket = std::nullopt);
-	bool onConnect(ConnectionPtr connection);
-	void onDisconnect(ConnectionPtr connection);
-	void onData(ConnectionPtr connection, const std::vector<std::uint8_t> data);
-	std::atomic<std::uint64_t> idCounter = 0;
-	void do_accept();
 	asio::io_context::strand serverStrand;
 	asio::ip::tcp::acceptor acceptor;
 	bool proxied = false;
-	std::size_t threads = 1;
-	void read_proxy_header(asio::ip::tcp::socket* s, proxyHeader& header);
 };
-
-// --- TCPConnection implementation ---
-template<typename Derived>
-TCPConnection<Derived>::TCPConnection(std::uint64_t id_, asio::ip::tcp::socket socket_, asio::ip::address ip_, asio::ip::address realIP_, asio::io_context& io_context)
-	: id(id_), socket(std::move(socket_)), ip(ip_), realIP(realIP_), strand(io_context), read_buffer(65535) {
-}
-template<typename Derived>
-void TCPConnection<Derived>::start() {
-	do_read();
-}
-template<typename Derived>
-void TCPConnection<Derived>::write(std::vector<std::uint8_t> data) {
-	auto self = this->shared_from_this();
-	if (disconnected)
-		return;
-	asio::post(strand, [this, self, data = std::move(data)]() {
-		bool write_in_progress = !write_queue.empty();
-		write_queue.push_back(std::move(data));
-		if (!write_in_progress) {
-			do_write();
-		}
-		});
-}
-template<typename Derived>
-void TCPConnection<Derived>::disconnect() {
-	disconnected = true;
-	auto self = this->shared_from_this();
-	asio::post(strand, [this, self]() {
-		if (!write_queue.empty()) {
-			return;
-		}
-		if (socket.is_open()) {
-			socket.shutdown(asio::socket_base::shutdown_both);
-			socket.close();
-		}
-		onDisconnect();
-		});
-}
-template<typename Derived>
-void TCPConnection<Derived>::shutdown() {
-	if (disconnected)
-	{
-		return;
-	}
-	disconnected = true;
-	auto self = this->shared_from_this();
-	asio::dispatch(strand, [this, self]() {
-		if (socket.is_open()) {
-			socket.shutdown(asio::socket_base::shutdown_both);
-			socket.close();
-		}
-		});
-	//we dont call onDisconnect because shutdown is used if connection didnt fire onConnect
-}
-template<typename Derived>
-void TCPConnection<Derived>::do_read() {
-	if (disconnected)
-	{
-		return;
-	}
-	auto self = this->shared_from_this();
-
-	auto buf = asio::buffer(this->read_buffer.data(), this->read_buffer.size());
-	socket.async_read_some(
-		buf,
-		asio::bind_executor(strand, [this, self](const std::error_code& ec, std::size_t length) {
-			if (!ec && length > 0) {
-				std::vector<std::uint8_t> data(read_buffer.begin(), read_buffer.begin() + length);
-				onData(std::move(data));
-				do_read();
-			}
-			else if (ec != asio::error::operation_aborted) {
-				if (!disconnected) {
-					disconnect();
-				}
-			}
-			})
-	);
-}
-template<typename Derived>
-void TCPConnection<Derived>::do_write() {
-	auto self = this->shared_from_this();
-	asio::async_write(
-		socket,
-		asio::buffer(write_queue.front()),
-		asio::bind_executor(strand, [this, self](std::error_code ec, std::size_t /*length*/) {
-			if (!ec) {
-				write_queue.pop_front();
-				if (!write_queue.empty()) {
-					do_write();
-				}
-				else if (disconnected)
-				{
-					disconnect();
-				}
-			}
-			else {
-				onError(ec, "Write failed");
-				disconnect();
-			}
-			})
-	);
-}
-
-// --- TCPServer implementation ---
-template<typename ConnectionType>
-TCPServer<ConnectionType>::TCPServer(const asio::ip::address& ip_, unsigned short port_, bool useProxy, std::size_t threads_)
-	: ip(ip_), port(port_), acceptor(context, asio::ip::tcp::endpoint(ip_, port_)), threads(threads_), proxied(useProxy), workGuard(asio::make_work_guard(context)), serverStrand(context) {
-}
-
-
-template<typename ConnectionType>
-TCPServer<ConnectionType>::~TCPServer() {
-	stop();
-	for (auto& thread : threadPool) {
-		if (thread.joinable()) {
-			thread.join();
-		}
-	}
-	running = false;
-	running.notify_all();
-}
-
-template<typename ConnectionType>
-void TCPServer<ConnectionType>::start()
-{
-	if (running)
-	{
-		return;
-	}
-	for (std::size_t i = 0; i < threads; i++) {
-		threadPool.emplace_back([this]() {
-			try {
-				this->context.run();
-			}
-			catch (const std::system_error& ex)
-			{
-				onError(ex.code(), std::string("context.run(): ") + ex.what());
-			}
-			catch (const std::exception& ex)
-			{
-				onError(std::make_error_code(std::errc::interrupted), std::string("context.run(): ") + ex.what());
-			}
-			catch (...)
-			{
-				onError(std::make_error_code(std::errc::invalid_argument), "Unknown error from context.run()");
-			}
-			});
-	}
-	do_accept();
-	running = true;
-}
-template<typename ConnectionType>
-void TCPServer<ConnectionType>::stop() {
-	if (!running)
-	{
-		return;
-	}
-	{
-		std::unique_lock lock(conGuard);
-		for (auto connection : connections) {
-			connection->shutdown();
-		}
-	}
-	std::promise<void> shutdownDone;
-	serverStrand.dispatch([this, &shutdownDone] {
-		acceptor.close();
-		workGuard.reset();
-		context.stop();
-		shutdownDone.set_value();
-		});
-	shutdownDone.get_future().wait();
-	running = false;
-	running.notify_all();
-}
-template<typename ConnectionType>
-bool TCPServer<ConnectionType>::join(ConnectionPtr connection) {
-	if (onConnect(connection)) {
-		std::lock_guard<std::recursive_mutex> lock(conGuard);
-		connections.push_back(connection);
-		return true;
-	}
-	else {
-		return false;
-	}
-}
-template<typename ConnectionType>
-void TCPServer<ConnectionType>::leave(ConnectionPtr connection) {
-	std::lock_guard<std::recursive_mutex> lock(conGuard);
-	auto it = std::find(connections.begin(), connections.end(), connection);
-	if (it != connections.end()) {
-		connections.erase(it);
-	}
-}
-template<typename ConnectionType>
-void TCPServer<ConnectionType>::addErrorHandler(std::function<bool(std::error_code, std::string_view, std::optional<ConnectionPtr>, std::optional<asio::ip::tcp::socket*>)> errorCallback) {
-	std::unique_lock lock(handlerGuard);
-	callbacks.onError.push_back(errorCallback);
-}
-template<typename ConnectionType>
-void TCPServer<ConnectionType>::addConnectHandler(std::function<bool(ConnectionPtr)> connectCallback) {
-	std::unique_lock lock(handlerGuard);
-	callbacks.onConnect.push_back(connectCallback);
-}
-template<typename ConnectionType>
-void TCPServer<ConnectionType>::addDisconnectHandler(std::function<void(ConnectionPtr)> disconnectCallback) {
-	std::unique_lock lock(handlerGuard);
-	callbacks.onDisconnect.push_back(disconnectCallback);
-}
-template<typename ConnectionType>
-void TCPServer<ConnectionType>::addDataHandler(std::function<void(ConnectionPtr, const std::vector<std::uint8_t>&)> dataCallback) {
-	std::unique_lock lock(handlerGuard);
-	callbacks.onData.push_back(dataCallback);
-}
-template<typename ConnectionType>
-bool TCPServer<ConnectionType>::onError(std::error_code ec, std::string_view message, std::optional<ConnectionPtr> connection, std::optional<asio::ip::tcp::socket*> socket) {
-	std::shared_lock lock(handlerGuard);
-	bool ret = true;
-	for (const auto& callback : callbacks.onError) {
-		if (!callback(ec, message, connection, socket)) {
-			ret = false;
-		}
-	}
-	return ret;
-}
-template<typename ConnectionType>
-bool TCPServer<ConnectionType>::onConnect(ConnectionPtr connection) {
-	std::shared_lock lock(handlerGuard);
-	for (const auto& callback : callbacks.onConnect) {
-		if (!callback(connection)) {
-			return false;
-		}
-	}
-	return true;
-}
-template<typename ConnectionType>
-void TCPServer<ConnectionType>::onDisconnect(ConnectionPtr connection) {
-	leave(connection);
-	std::shared_lock lock(handlerGuard);
-	for (const auto& callback : callbacks.onDisconnect) {
-		callback(connection);
-	}
-}
-template<typename ConnectionType>
-void TCPServer<ConnectionType>::onData(ConnectionPtr connection, const std::vector<std::uint8_t> data) {
-	std::shared_lock lock(handlerGuard);
-	for (const auto& callback : callbacks.onData) {
-		callback(connection, data); //callback takes const reference to data
-	}
-}
-template<typename ConnectionType>
-void TCPServer<ConnectionType>::do_accept() {
-	serverStrand.post([this] {
-		acceptor.async_accept(
-			[this](std::error_code ec, asio::ip::tcp::socket socket) {
-				if (!ec) {
-					std::uint64_t connectionID = idCounter.fetch_add(1);
-					asio::ip::address ip = socket.remote_endpoint().address();
-					asio::ip::address realIP;
-					if (!proxied) {
-						realIP = ip;
-					}
-					else {
-						proxyHeader proxyheader;
-						read_proxy_header(&socket, proxyheader);
-						auto status = proxyheader.decode_header();
-						if (status == proxyHeaderParseStatus::SuccessProxy) {
-							realIP = asio::ip::make_address_v4(proxyheader.src_addr);
-						}
-						else {
-							onError(std::make_error_code(std::errc::invalid_argument), "Proxy header failed " + std::to_string(static_cast<int>(status)), std::nullopt, &socket);
-							return;
-						}
-					}
-					ConnectionPtr conn = std::make_shared<ConnectionType>(connectionID, std::move(socket), ip, realIP, context);
-					conn->setCallbacks({
-						.onError = [this](std::error_code ec, std::string_view message, ConnectionPtr connection) { this->onError(ec,message,connection); },
-						.onDisconnect = [this](ConnectionPtr connection) {this->onDisconnect(connection); },
-						.onData = [this](ConnectionPtr connection, std::vector<std::uint8_t> data) { this->onData(connection,std::move(data)); }
-						});
-					bool allowed = join(conn);
-					if (allowed) {
-						conn->start();
-					}
-					else {
-						onError(std::make_error_code(std::errc::permission_denied), "Connection not allowed", conn, std::nullopt);
-						conn->shutdown();
-					}
-				}
-				else {
-					onError(ec, "Accept failed", std::nullopt, &socket);
-				}
-				do_accept();
-			});
-		});
-}
-
-template<typename ConnectionType>
-void TCPServer<ConnectionType>::read_proxy_header(asio::ip::tcp::socket* s, proxyHeader& header) {
-	asio::read(*s, asio::buffer(header.data(), header.size()));
-}
 
 // UDP
 
